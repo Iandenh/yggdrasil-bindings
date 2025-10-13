@@ -3,12 +3,14 @@ use std::{
     ffi::{c_char, c_void, CStr, CString},
     fmt::{self, Display, Formatter},
     mem::forget,
+    panic::{self, AssertUnwindSafe},
     str::Utf8Error,
     sync::{Arc, Mutex, MutexGuard},
 };
 
 use chrono::Utc;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use unleash_types::client_features::ClientFeatures;
 use unleash_types::client_metrics::MetricBucket;
 use unleash_yggdrasil::{
     state::EnrichedContext, Context, EngineState, EvalWarning, ExtendedVariantDef, ResolvedToggle,
@@ -47,6 +49,7 @@ impl Into<ResolvedToggleState> for ResolvedToggle {
 
 type RawPointerDataType = Mutex<EngineState>;
 type ManagedEngine = Arc<RawPointerDataType>;
+type CustomStrategyResults = HashMap<String, bool>;
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 enum ResponseCode {
@@ -82,6 +85,7 @@ enum FFIError {
     Utf8Error,
     NullError,
     InvalidJson(String),
+    Panic,
     PartialUpdate(Vec<EvalWarning>),
 }
 
@@ -95,6 +99,10 @@ impl Display for FFIError {
                 f,
                 "Engine state was updated but warnings were reported, this may result in some flags evaluating in unexpected ways, please report this: {:?}",
                 messages
+            ),
+            FFIError::Panic => write!(
+                f,
+                "Engine panicked while processing the request. Please report this as a bug with the accompanying stack trace if available."
             ),
         }
     }
@@ -129,6 +137,28 @@ fn result_to_json_ptr<T: Serialize>(result: Result<Option<T>, FFIError>) -> *mut
     let response: Response<T> = result.into();
     let json_string = serde_json::to_string(&response).unwrap();
     CString::new(json_string).unwrap().into_raw()
+}
+
+fn guard_result<T, F>(action: F) -> Result<Option<T>, FFIError>
+where
+    F: FnOnce() -> Result<Option<T>, FFIError>,
+{
+    match panic::catch_unwind(AssertUnwindSafe(action)) {
+        Ok(result) => result,
+        Err(_) => Err(FFIError::Panic),
+    }
+}
+
+fn parse_custom_results(
+    results_ptr: *const c_char,
+) -> Result<Option<CustomStrategyResults>, FFIError> {
+    if results_ptr.is_null() {
+        return Ok(None);
+    }
+
+    let results = unsafe { get_json::<CustomStrategyResults>(results_ptr)? };
+
+    Ok(Some(results))
 }
 
 unsafe fn get_engine(engine_ptr: *mut c_void) -> Result<ManagedEngine, FFIError> {
@@ -196,7 +226,7 @@ pub unsafe extern "C" fn take_state(
     engine_ptr: *mut c_void,
     json_ptr: *const c_char,
 ) -> *const c_char {
-    let result: Result<Option<()>, FFIError> = (|| {
+    let result = guard_result::<(), _>(|| {
         let guard = get_engine(engine_ptr)?;
         let mut engine = recover_lock(&guard);
 
@@ -207,7 +237,24 @@ pub unsafe extern "C" fn take_state(
         } else {
             Ok(Some(()))
         }
-    })();
+    });
+
+    result_to_json_ptr(result)
+}
+
+/// Gets the current state of the engine as a JSON encoded `ClientFeatures` structure.
+///
+/// # Safety
+///
+/// This function dereferences the engine_ptr argument, and so this function should not
+/// be called with a null pointer.
+#[no_mangle]
+pub unsafe extern "C" fn get_state(engine_ptr: *mut c_void) -> *const c_char {
+    let result = guard_result::<ClientFeatures, _>(|| {
+        let guard = get_engine(engine_ptr)?;
+        let engine = recover_lock(&guard);
+        Ok(Some(engine.get_state()))
+    });
 
     result_to_json_ptr(result)
 }
@@ -228,21 +275,24 @@ pub unsafe extern "C" fn check_enabled(
     engine_ptr: *mut c_void,
     toggle_name_ptr: *const c_char,
     context_ptr: *const c_char,
+    custom_strategy_results_ptr: *const c_char,
 ) -> *const c_char {
-    let result: Result<Option<bool>, FFIError> = (|| {
+    let result = guard_result::<bool, _>(|| {
         let guard = get_engine(engine_ptr)?;
         let engine = recover_lock(&guard);
 
         let toggle_name = get_str(toggle_name_ptr)?;
         let context: Context = get_json(context_ptr)?;
-
-        let enriched_context = EnrichedContext::from(context, toggle_name.into(), None);
+        let custom_strategy_results = parse_custom_results(custom_strategy_results_ptr)?;
+        let enriched_context =
+            EnrichedContext::from(context, toggle_name.into(), custom_strategy_results);
 
         Ok(engine.check_enabled(&enriched_context))
-    })();
+    });
 
     result_to_json_ptr(result)
 }
+
 
 /// Resolves all toggles for a given context.
 ///
@@ -340,19 +390,22 @@ pub unsafe extern "C" fn check_variant(
     engine_ptr: *mut c_void,
     toggle_name_ptr: *const c_char,
     context_ptr: *const c_char,
+    custom_strategy_results_ptr: *const c_char,
 ) -> *const c_char {
-    let result: Result<Option<ExtendedVariantDef>, FFIError> = (|| {
+    let result = guard_result::<ExtendedVariantDef, _>(|| {
         let guard = get_engine(engine_ptr)?;
         let engine = recover_lock(&guard);
 
         let toggle_name = get_str(toggle_name_ptr)?;
         let context: Context = get_json(context_ptr)?;
-        let enriched_context = EnrichedContext::from(context, toggle_name.into(), None);
+        let custom_strategy_results = parse_custom_results(custom_strategy_results_ptr)?;
+        let enriched_context =
+            EnrichedContext::from(context, toggle_name.into(), custom_strategy_results);
 
         let base_variant = engine.check_variant(&enriched_context);
         let toggle_enabled = engine.check_enabled(&enriched_context).unwrap_or_default();
         Ok(base_variant.map(|variant| variant.to_enriched_response(toggle_enabled)))
-    })();
+    });
 
     result_to_json_ptr(result)
 }
@@ -421,7 +474,7 @@ pub unsafe extern "C" fn count_toggle(
 
     let enabled = enabled & 1 == 1;
 
-    let result: Result<Option<()>, FFIError> = (|| {
+    let result = guard_result::<(), _>(|| {
         let guard = get_engine(engine_ptr)?;
         let engine = recover_lock(&guard);
 
@@ -429,7 +482,7 @@ pub unsafe extern "C" fn count_toggle(
 
         engine.count_toggle(toggle_name, enabled);
         Ok(Some(()))
-    })();
+    });
 
     result_to_json_ptr(result)
 }
@@ -452,7 +505,7 @@ pub unsafe extern "C" fn count_variant(
     toggle_name_ptr: *const c_char,
     variant_name_ptr: *const c_char,
 ) -> *const c_char {
-    let result: Result<Option<()>, FFIError> = (|| {
+    let result = guard_result::<(), _>(|| {
         let guard = get_engine(engine_ptr)?;
         let engine = recover_lock(&guard);
 
@@ -461,7 +514,7 @@ pub unsafe extern "C" fn count_variant(
 
         engine.count_variant(toggle_name, variant_name);
         Ok(Some(()))
-    })();
+    });
 
     result_to_json_ptr(result)
 }
@@ -480,12 +533,12 @@ pub unsafe extern "C" fn count_variant(
 /// `free_response` and passing in the pointer returned by this method. Failure to do so will result in a leak.
 #[no_mangle]
 pub unsafe extern "C" fn get_metrics(engine_ptr: *mut c_void) -> *mut c_char {
-    let result: Result<Option<MetricBucket>, FFIError> = (|| {
+    let result = guard_result::<MetricBucket, _>(|| {
         let guard = get_engine(engine_ptr)?;
         let mut engine = recover_lock(&guard);
 
         Ok(engine.get_metrics(Utc::now()))
-    })();
+    });
 
     result_to_json_ptr(result)
 }
@@ -502,14 +555,14 @@ pub unsafe extern "C" fn should_emit_impression_event(
     engine_ptr: *mut c_void,
     toggle_name_ptr: *const c_char,
 ) -> *mut c_char {
-    let result: Result<Option<bool>, FFIError> = (|| {
+    let result = guard_result::<bool, _>(|| {
         let guard = get_engine(engine_ptr)?;
         let engine = recover_lock(&guard);
 
         let toggle_name = get_str(toggle_name_ptr)?;
 
         Ok(Some(engine.should_emit_impression_event(toggle_name)))
-    })();
+    });
 
     result_to_json_ptr(result)
 }
@@ -527,12 +580,12 @@ pub unsafe extern "C" fn should_emit_impression_event(
 /// `free_response` and passing in the pointer returned by this method. Failure to do so will result in a leak.
 #[no_mangle]
 pub unsafe extern "C" fn list_known_toggles(engine_ptr: *mut c_void) -> *mut c_char {
-    let result: Result<Option<Vec<ToggleDefinition>>, FFIError> = (|| {
+    let result = guard_result::<Vec<ToggleDefinition>, _>(|| {
         let guard = get_engine(engine_ptr)?;
         let engine = recover_lock(&guard);
 
         Ok(Some(engine.list_known_toggles()))
-    })();
+    });
 
     result_to_json_ptr(result)
 }
@@ -551,12 +604,15 @@ mod tests {
 
         let c_toggle_name = CString::new("some-toggle").unwrap();
         let c_context = CString::new("{}").unwrap();
+        let c_results = CString::new("{}").unwrap();
 
         let toggle_name_ptr = c_toggle_name.as_ptr();
         let context_ptr = c_context.as_ptr();
+        let results_ptr = c_results.as_ptr();
 
         unsafe {
-            let string_response = check_enabled(engine_ptr, toggle_name_ptr, context_ptr);
+            let string_response =
+                check_enabled(engine_ptr, toggle_name_ptr, context_ptr, results_ptr);
             let response = CStr::from_ptr(string_response).to_str().unwrap();
             let enabled_response: Response<bool> = serde_json::from_str(response).unwrap();
 
@@ -573,9 +629,11 @@ mod tests {
 
         let c_toggle_name = CString::new(toggle_under_test).unwrap();
         let c_context = CString::new("{}").unwrap();
+        let c_results = CString::new("{}").unwrap();
 
         let toggle_name_ptr = c_toggle_name.as_ptr();
         let context_ptr = c_context.as_ptr();
+        let results_ptr = c_results.as_ptr();
 
         let client_features = ClientFeatures {
             features: vec![ClientFeature {
@@ -603,7 +661,8 @@ mod tests {
             let warnings = engine.take_state(UpdateMessage::FullResponse(client_features));
             drop(engine);
 
-            let string_response = check_enabled(engine_ptr, toggle_name_ptr, context_ptr);
+            let string_response =
+                check_enabled(engine_ptr, toggle_name_ptr, context_ptr, results_ptr);
             let response = CStr::from_ptr(string_response).to_str().unwrap();
             let enabled_response: Response<bool> = serde_json::from_str(response).unwrap();
 
@@ -620,11 +679,14 @@ mod tests {
         unsafe {
             let c_toggle_name = CString::new("some-toggle").unwrap();
             let c_context = CString::new("{}").unwrap();
+            let c_results = CString::new("{}").unwrap();
 
             let toggle_name_ptr = c_toggle_name.as_ptr();
             let context_ptr = c_context.as_ptr();
+            let results_ptr = c_results.as_ptr();
 
-            let string_response = check_enabled(engine_ptr, toggle_name_ptr, context_ptr);
+            let string_response =
+                check_enabled(engine_ptr, toggle_name_ptr, context_ptr, results_ptr);
             let response = CStr::from_ptr(string_response).to_str().unwrap();
             let enabled_response: Response<bool> = serde_json::from_str(response).unwrap();
 
@@ -639,11 +701,14 @@ mod tests {
 
         unsafe {
             let c_context = CString::new("{}").unwrap();
+            let c_results = CString::new("{}").unwrap();
 
             let toggle_name_ptr = std::ptr::null();
             let context_ptr = c_context.as_ptr();
+            let results_ptr = c_results.as_ptr();
 
-            let string_response = check_enabled(engine_ptr, toggle_name_ptr, context_ptr);
+            let string_response =
+                check_enabled(engine_ptr, toggle_name_ptr, context_ptr, results_ptr);
             let response = CStr::from_ptr(string_response).to_str().unwrap();
             let enabled_response: Response<bool> = serde_json::from_str(response).unwrap();
 
@@ -658,11 +723,14 @@ mod tests {
 
         unsafe {
             let c_toggle_name = CString::new("some-toggle").unwrap();
+            let c_results = CString::new("{}").unwrap();
 
             let toggle_name_ptr = c_toggle_name.as_ptr();
             let context_ptr = std::ptr::null();
+            let results_ptr = c_results.as_ptr();
 
-            let string_response = check_enabled(engine_ptr, toggle_name_ptr, context_ptr);
+            let string_response =
+                check_enabled(engine_ptr, toggle_name_ptr, context_ptr, results_ptr);
             let response = CStr::from_ptr(string_response).to_str().unwrap();
             let enabled_response: Response<bool> = serde_json::from_str(response).unwrap();
 
@@ -678,9 +746,11 @@ mod tests {
 
         let c_toggle_name = CString::new(toggle_under_test).unwrap();
         let c_context = CString::new("{}").unwrap();
+        let c_results = CString::new("{}").unwrap();
 
         let toggle_name_ptr = c_toggle_name.as_ptr();
         let context_ptr = c_context.as_ptr();
+        let results_ptr = c_results.as_ptr();
 
         let client_features = ClientFeatures {
             features: vec![ClientFeature {
@@ -716,7 +786,8 @@ mod tests {
             let warnings = engine.take_state(UpdateMessage::FullResponse(client_features));
             drop(engine);
 
-            let string_response = check_variant(engine_ptr, toggle_name_ptr, context_ptr);
+            let string_response =
+                check_variant(engine_ptr, toggle_name_ptr, context_ptr, results_ptr);
             let response = CStr::from_ptr(string_response).to_str().unwrap();
             let variant_response: Response<ExtendedVariantDef> =
                 serde_json::from_str(response).unwrap();
@@ -785,6 +856,77 @@ mod tests {
             assert_eq!(known_features.len(), 2);
             assert!(known_features.iter().any(|t| t.name == "toggle1"));
             assert!(known_features.iter().any(|t| t.name == "toggle2"));
+        }
+    }
+
+    #[test]
+    fn get_state_returns_default_when_no_features_loaded() {
+        let engine_ptr = new_engine();
+
+        unsafe {
+            let string_response = get_state(engine_ptr);
+            let response = CStr::from_ptr(string_response).to_str().unwrap();
+            let state_response: Response<ClientFeatures> = serde_json::from_str(response).unwrap();
+
+            assert!(state_response.status_code == ResponseCode::Ok);
+            let state = state_response.value.expect("Expected state");
+            assert!(state.features.is_empty());
+            assert_eq!(state.version, 2);
+        }
+    }
+
+    #[test]
+    fn get_state_returns_loaded_features() {
+        let engine_ptr = new_engine();
+        let client_features = ClientFeatures {
+            features: vec![ClientFeature {
+                name: "test-toggle".into(),
+                enabled: true,
+                strategies: Some(vec![Strategy {
+                    name: "default".into(),
+                    constraints: None,
+                    parameters: None,
+                    segments: None,
+                    sort_order: None,
+                    variants: None,
+                }]),
+                ..Default::default()
+            }],
+            query: None,
+            segments: None,
+            version: 2,
+            meta: None,
+        };
+
+        unsafe {
+            let engine_guard = get_engine(engine_ptr).expect("Expected a valid engine pointer");
+            let mut engine = engine_guard.lock().expect("Failed to lock engine mutex");
+            engine.take_state(UpdateMessage::FullResponse(client_features));
+            drop(engine);
+
+            let string_response = get_state(engine_ptr);
+            let response = CStr::from_ptr(string_response).to_str().unwrap();
+            let state_response: Response<ClientFeatures> = serde_json::from_str(response).unwrap();
+
+            assert!(state_response.status_code == ResponseCode::Ok);
+            let state = state_response.value.expect("Expected state");
+            assert_eq!(state.features.len(), 1);
+            assert_eq!(state.features[0].name, "test-toggle");
+            assert_eq!(state.version, 2);
+        }
+    }
+
+    #[test]
+    fn get_state_handles_null_engine_pointer() {
+        let engine_ptr = std::ptr::null_mut();
+
+        unsafe {
+            let string_response = get_state(engine_ptr);
+            let response = CStr::from_ptr(string_response).to_str().unwrap();
+            let state_response: Response<ClientFeatures> = serde_json::from_str(response).unwrap();
+
+            assert!(state_response.status_code == ResponseCode::Error);
+            assert!(state_response.error_message.is_some());
         }
     }
 }
