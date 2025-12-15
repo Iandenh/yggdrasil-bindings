@@ -16,6 +16,8 @@ use unleash_yggdrasil::{
     state::EnrichedContext, Context, EngineState, EvalWarning, ExtendedVariantDef, ResolvedToggle,
     ToggleDefinition, UpdateMessage, CORE_VERSION, KNOWN_STRATEGIES,
 };
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod compat_glibc;
 
 pub mod flat;
 
